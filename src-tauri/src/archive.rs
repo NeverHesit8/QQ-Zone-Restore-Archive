@@ -2282,6 +2282,13 @@ fn archive_quality_summary(
         .map_err(|error| format!("统计归档完整度失败：{error}"))
 }
 
+fn history_start_offset(page: u32) -> Result<u32, String> {
+    page.checked_sub(1)
+        .and_then(|index| index.checked_mul(30))
+        .filter(|offset| *offset <= 10_000_000)
+        .ok_or_else(|| "历史消息起始页必须在 1 到 333334 之间".into())
+}
+
 async fn sync_history_messages(
     app: &tauri::AppHandle,
     login: &QLoginState,
@@ -2289,6 +2296,7 @@ async fn sync_history_messages(
     owner_uin: &str,
     owner_name: Option<&str>,
     interval_ms: u64,
+    start_offset: u32,
 ) -> Result<HistorySyncSummary, String> {
     // QQ's legacy notification list can contain holes: an empty offset does not
     // prove that every later offset is empty. Read it sequentially and only stop
@@ -2303,10 +2311,11 @@ async fn sync_history_messages(
     const EMPTY_TAIL_POSITIONS: u32 = 6_000;
     let mut summary = HistorySyncSummary::default();
     set_progress(archive, |progress| {
-        progress.message = "正在顺序读取历史消息，并验证最后 6,000 个位置是否为空…".into();
+        progress.message =
+            format!("正在从历史 offset {start_offset} 顺序读取，并验证最后 6,000 个位置是否为空…");
     });
 
-    let mut offset = 0_u32;
+    let mut offset = start_offset;
     let mut consecutive_empty_positions = 0_u32;
     let mut last_nonempty_offset: Option<u32> = None;
     while offset <= MAX_HISTORY_OFFSET && consecutive_empty_positions < EMPTY_TAIL_POSITIONS {
@@ -2412,7 +2421,13 @@ pub async fn start_feed_archive(
     login: tauri::State<'_, QLoginState>,
     archive: tauri::State<'_, ArchiveState>,
     interval_ms: u64,
+    history_start_page: Option<u32>,
 ) -> Result<ArchiveProgress, String> {
+    // Validate before changing task state; the normal archive retains its default behavior.
+    let start_offset = history_start_page
+        .map(history_start_offset)
+        .transpose()?
+        .unwrap_or(0);
     let interval_ms = interval_ms.clamp(2_000, 30_000);
     {
         let mut progress = archive.progress.lock().map_err(|_| "归档状态锁已损坏")?;
@@ -2433,7 +2448,11 @@ pub async fn start_feed_archive(
     let owner_uin = login.qzone_auth().await?.uin;
     let saved_skip_count = unresolved_skip_count(&app, &owner_uin)?;
     set_progress(&archive, |progress| progress.skipped = saved_skip_count);
-    let checkpoint = load_checkpoint(&app, &owner_uin)?;
+    let checkpoint = if history_start_page.is_some() {
+        None
+    } else {
+        load_checkpoint(&app, &owner_uin)?
+    };
     let stale_checkpoint = checkpoint
         .as_ref()
         .is_some_and(|value| checkpoint_is_stale(value, now()));
@@ -2463,14 +2482,16 @@ pub async fn start_feed_archive(
     let mut visible_sync_error: Option<String> = None;
     let mut history_sync_error: Option<String> = None;
     let interaction_result: Result<(), String> = async {
-        match sync_visible_moments(&app, &login, &archive, &owner_uin, interval_ms).await {
-            Ok(summary) => visible_summary = summary,
-            Err(error) if error.starts_with("ARCHIVE_RATE_LIMIT:") => return Err(error),
-            Err(error) => {
-                visible_sync_error = Some(concise_archive_error(&error));
-                set_progress(&archive, |progress| {
-                    progress.message = "本人说说接口暂时不可用，正在改用历史消息接口继续归档…".into();
-                });
+        if history_start_page.is_none() {
+            match sync_visible_moments(&app, &login, &archive, &owner_uin, interval_ms).await {
+                Ok(summary) => visible_summary = summary,
+                Err(error) if error.starts_with("ARCHIVE_RATE_LIMIT:") => return Err(error),
+                Err(error) => {
+                    visible_sync_error = Some(concise_archive_error(&error));
+                    set_progress(&archive, |progress| {
+                        progress.message = "本人说说接口暂时不可用，正在改用历史消息接口继续归档…".into();
+                    });
+                }
             }
         }
         if visible_summary.owner_name.is_none() {
@@ -2501,18 +2522,25 @@ pub async fn start_feed_archive(
             &owner_uin,
             visible_summary.owner_name.as_deref(),
             interval_ms,
+            start_offset,
         )
         .await
         {
             Ok(summary) => history_summary = summary,
             Err(error) if error.starts_with("ARCHIVE_RATE_LIMIT:") => return Err(error),
             Err(error) => {
+                if history_start_page.is_some() {
+                    return Err(error);
+                }
                 history_sync_error = Some(concise_archive_error(&error));
                 set_progress(&archive, |progress| {
                     progress.message =
                         "历史消息接口暂时不可用，正在用互动通知接口补充已删除残留…".into();
                 });
             }
+        }
+        if history_start_page.is_some() {
+            return Ok(());
         }
         loop {
             if archive.cancel.load(Ordering::Relaxed) {
@@ -2728,7 +2756,9 @@ pub async fn start_feed_archive(
         }),
         Ok(()) => set_progress(&archive, |p| {
             p.status = "completed";
-            p.message = if let (Some(visible_error), Some(history_error)) =
+            p.message = if let Some(page) = history_start_page {
+                format!("历史消息读取完成：从第 {page} 页（offset {start_offset}）开始，共读取 {} 页、{} 条历史消息，写入 {} 条记录；空尾最深验证至 offset {}", history_summary.pages, history_summary.records, history_summary.saved, history_summary.deepest_probe_offset)
+            } else if let (Some(visible_error), Some(history_error)) =
                 (visible_sync_error.as_deref(), history_sync_error.as_deref())
             {
                 format!(
@@ -5114,6 +5144,16 @@ mod tests {
             video_cover_url(Some(value.to_string())).as_deref(),
             Some("https://example.com/cover.jpg")
         );
+    }
+
+    #[test]
+    fn validates_custom_history_start_page() {
+        assert_eq!(super::history_start_offset(1).unwrap(), 0);
+        assert_eq!(super::history_start_offset(101).unwrap(), 3000);
+        assert_eq!(super::history_start_offset(333334).unwrap(), 9_999_990);
+        assert!(super::history_start_offset(0).is_err());
+        assert!(super::history_start_offset(333335).is_err());
+        assert!(super::history_start_offset(u32::MAX).is_err());
     }
 
     #[test]
