@@ -45,6 +45,7 @@ impl Default for ArchiveProgress {
 pub struct ArchiveState {
     progress: Mutex<ArchiveProgress>,
     cancel: AtomicBool,
+    pub(crate) history_scan_gate: tokio::sync::Semaphore,
     image_downloads: tokio::sync::Semaphore,
 }
 
@@ -53,6 +54,7 @@ impl ArchiveState {
         Self {
             progress: Mutex::new(ArchiveProgress::default()),
             cancel: AtomicBool::new(false),
+            history_scan_gate: tokio::sync::Semaphore::new(1),
             image_downloads: tokio::sync::Semaphore::new(4),
         }
     }
@@ -1442,7 +1444,10 @@ fn checkpoint_is_stale(checkpoint: &ArchiveCheckpoint, current: i64) -> bool {
     current.saturating_sub(checkpoint.updated_at) >= ARCHIVE_CURSOR_MAX_AGE_SECONDS
 }
 
-fn reserve_archive_page(app: &tauri::AppHandle, owner_uin: &str) -> Result<Option<i64>, String> {
+pub(crate) fn reserve_archive_page(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+) -> Result<Option<i64>, String> {
     let connection = open_database(app)?;
     let current = now();
     let state = connection.query_row(
@@ -2423,6 +2428,10 @@ pub async fn start_feed_archive(
     interval_ms: u64,
     history_start_page: Option<u32>,
 ) -> Result<ArchiveProgress, String> {
+    let _scan_guard = archive
+        .history_scan_gate
+        .try_acquire()
+        .map_err(|_| "已有归档或接口诊断正在运行")?;
     // Validate before changing task state; the normal archive retains its default behavior.
     let start_offset = history_start_page
         .map(history_start_offset)
@@ -2934,6 +2943,10 @@ pub async fn retry_archive_skip(
     archive: tauri::State<'_, ArchiveState>,
     id: i64,
 ) -> Result<ArchiveSkipRetryResult, String> {
+    let _scan_guard = archive
+        .history_scan_gate
+        .try_acquire()
+        .map_err(|_| "已有归档或接口诊断正在运行")?;
     let owner_uin = login.qzone_auth().await?.uin;
     let connection = open_database(&app)?;
     let (cursor, resolved_at) = connection
