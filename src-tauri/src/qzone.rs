@@ -1946,7 +1946,7 @@ fn history_record_hash(parts: &[&str]) -> u64 {
         })
 }
 
-fn decode_history_html(response: &str) -> Result<String, String> {
+pub(crate) fn decode_history_html(response: &str) -> Result<String, String> {
     let capture = regex::Regex::new(r"(?s)html\s*:\s*'(.*)',\s*opuin")
         .expect("fixed history response regex")
         .captures(response)
@@ -2370,21 +2370,18 @@ fn history_html_as_feeds(
     (scanned_count, feeds)
 }
 
-pub(crate) async fn fetch_history_messages(
+pub(crate) fn history_messages_request(
     state: &QLoginState,
+    auth: &crate::qlogin::QzoneAuth,
     offset: u32,
     count: u32,
-    owner_name: Option<&str>,
-) -> Result<HistoryMessagePage, String> {
-    let auth = state.qzone_auth().await?;
-    // The endpoint accepts a larger count while probing, but in live responses
-    // it can return an empty body for count=100. Thirty is the largest window
-    // we have verified to return the actual notification cards reliably.
-    let count = count.clamp(1, 30);
+    begin_time: i64,
+    end_time: i64,
+) -> reqwest::RequestBuilder {
     let query = vec![
         ("uin", auth.uin.clone()),
-        ("begin_time", "0".into()),
-        ("end_time", "0".into()),
+        ("begin_time", begin_time.to_string()),
+        ("end_time", end_time.to_string()),
         ("getappnotification", "1".into()),
         ("getnotifi", "1".into()),
         ("has_get_key", "0".into()),
@@ -2398,9 +2395,7 @@ pub(crate) async fn fetch_history_messages(
         ("g_tk", auth.g_tk.to_string()),
         ("g_tk", auth.g_tk.to_string()),
     ];
-    let mut last_error = String::new();
-    for attempt in 1..=FEED_RESPONSE_ATTEMPTS {
-        let response = state
+    state
             .client()
             .get(HISTORY_MESSAGES_URL)
             .header(
@@ -2421,6 +2416,22 @@ pub(crate) async fn fetch_history_messages(
             .header("Sec-Fetch-Site", "same-origin")
             .header("Upgrade-Insecure-Requests", "1")
             .query(&query)
+}
+
+pub(crate) async fn fetch_history_messages(
+    state: &QLoginState,
+    offset: u32,
+    count: u32,
+    owner_name: Option<&str>,
+) -> Result<HistoryMessagePage, String> {
+    let auth = state.qzone_auth().await?;
+    // The endpoint accepts a larger count while probing, but in live responses
+    // it can return an empty body for count=100. Thirty is the largest window
+    // we have verified to return the actual notification cards reliably.
+    let count = count.clamp(1, 30);
+    let mut last_error = String::new();
+    for attempt in 1..=FEED_RESPONSE_ATTEMPTS {
+        let response = history_messages_request(state, &auth, offset, count, 0, 0)
             .send()
             .await;
         match response {

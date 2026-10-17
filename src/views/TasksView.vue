@@ -5,6 +5,7 @@ import Button from "primevue/button";
 import InputNumber from "primevue/inputnumber";
 import ProgressBar from "primevue/progressbar";
 import Tag from "primevue/tag";
+import HistoryDiagnostics from "../components/HistoryDiagnostics.vue";
 import {
   cancelFeedArchive, getArchiveProgress, listArchiveSkips, retryArchiveSkip, startFeedArchive,
   type ArchiveProgress, type ArchiveSkipItem,
@@ -16,6 +17,7 @@ const authStore = useAuthStore();
 const { loggedIn } = storeToRefs(authStore);
 const progress = ref<ArchiveProgress>({ status: "idle", pages: 0, fetched: 0, saved: 0, skipped: 0, message: "尚未开始归档" });
 const skips = ref<ArchiveSkipItem[]>([]);
+const diagnosticsRunning = ref(false);
 const historyStartPage = ref<number | null>(1);
 const validHistoryPage = computed(() => Number.isInteger(historyStartPage.value) && Number(historyStartPage.value) >= 1 && Number(historyStartPage.value) <= 333334);
 const historyOffset = computed(() => validHistoryPage.value ? (Number(historyStartPage.value) - 1) * 30 : undefined);
@@ -38,7 +40,7 @@ async function refresh() {
 }
 function beginPolling() { clearInterval(timer); timer = setInterval(() => { currentTime.value = Date.now(); void refresh(); }, 1500); }
 async function start(historyOnly = false) {
-  if (!loggedIn.value || (historyOnly && !validHistoryPage.value)) return;
+  if (diagnosticsRunning.value || !loggedIn.value || (historyOnly && !validHistoryPage.value)) return;
   beginPolling();
   try { progress.value = await startFeedArchive(getArchiveInterval(), historyOnly ? Number(historyStartPage.value) : undefined); }
   catch { await refresh(); }
@@ -78,17 +80,19 @@ onBeforeUnmount(() => clearInterval(timer));
     <div v-if="rateLimited" class="task-rate-limit"><span><i class="pi pi-shield" /></span><div><strong>接口频率保护</strong><p>为防止接口请求过于频繁，每 10 分钟最多请求 300 页。归档进度已保存，{{ rateWaiting ? `等待 ${remainingText} 后可继续` : "现在可以继续归档" }}。</p></div><b v-if="rateWaiting">{{ remainingText }}</b></div>
     <div class="task-stats"><div><span>已读取页数</span><strong>{{ progress.pages }}</strong></div><div><span>接口记录</span><strong>{{ progress.fetched }}</strong></div><div><span>写入记录</span><strong>{{ progress.saved }}</strong></div><div><span>待重试异常</span><strong>{{ progress.skipped }}</strong></div></div>
     <div v-if="!loggedIn" class="task-login-notice"><span><i class="pi pi-lock" /></span><div><strong>请先登录 QQ 空间</strong><p>登录后才能创建或继续归档任务。</p></div><Button label="立即登录" icon="pi pi-sign-in" size="small" @click="authStore.openLogin" /></div>
-    <div class="task-actions"><Button :label="running ? '归档中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档'" icon="pi pi-download" :disabled="running || rateWaiting || !loggedIn" @click="start()" /><Button v-if="running" label="取消" icon="pi pi-times" severity="secondary" outlined @click="cancel" /></div>
+    <div class="task-actions"><Button :label="running ? '归档中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档'" icon="pi pi-download" :disabled="diagnosticsRunning || running || rateWaiting || !loggedIn" @click="start()" /><Button v-if="running" label="取消" icon="pi pi-times" severity="secondary" outlined @click="cancel" /></div>
     <div class="history-start">
       <label for="history-start-page">历史消息起始页</label>
       <div class="history-start-controls">
-        <InputNumber v-model="historyStartPage" inputId="history-start-page" :min="1" :max="333334" :maxFractionDigits="0" :useGrouping="false" showButtons :disabled="running" />
-        <Button label="从指定页读取历史" icon="pi pi-forward" severity="secondary" outlined :disabled="running || rateWaiting || !loggedIn || !validHistoryPage" @click="start(true)" />
+        <InputNumber v-model="historyStartPage" inputId="history-start-page" :min="1" :max="333334" :maxFractionDigits="0" :useGrouping="false" showButtons :disabled="diagnosticsRunning || running" />
+        <Button label="从指定页读取历史" icon="pi pi-forward" severity="secondary" outlined :disabled="diagnosticsRunning || running || rateWaiting || !loggedIn || !validHistoryPage" @click="start(true)" />
       </div>
       <p>每页按 30 个位置计算，第 1 页从头读取<span v-if="historyOffset !== undefined">；当前起始 offset：{{ historyOffset }}</span>。只读取历史消息，跳过本人说说和移动端互动通知；已保存记录自动去重。</p>
       <p>如日志显示上次 offset 为 3000，可填第 101 页重新读取该位置。历史接口降为 10 条窗口时，请以日志 offset 为准，选择对应或更早的起始页。</p>
     </div>
   </section>
+
+  <HistoryDiagnostics :archive-busy="running || rateWaiting" @busy="diagnosticsRunning = $event" />
 
   <section v-if="skips.length" class="surface-card task-skips">
     <div class="task-skips-heading"><div><span><i class="pi pi-exclamation-triangle" /></span><div><p class="section-kicker">SKIPPED REQUESTS</p><h3>异常重试列表</h3></div></div><small>临时接口故障不会再自动大跨度跳过；请稍后逐条重试。</small></div>
@@ -101,7 +105,7 @@ onBeforeUnmount(() => clearInterval(timer));
           <p>{{ item.error }}</p>
           <small>跳过于 {{ formatTime(item.skippedAt) }}<template v-if="item.retryCount"> · 已重试 {{ item.retryCount }} 次 · 最近 {{ formatTime(item.lastRetryAt) }}</template><template v-if="item.resolvedAt"> · 恢复 {{ item.recoveredRecords }} 条</template></small>
         </div>
-        <Button :label="retryingId === item.id ? '重试中…' : item.resolvedAt ? '已恢复' : '单独重试'" icon="pi pi-refresh" size="small" outlined :loading="retryingId === item.id" :disabled="running || Boolean(item.resolvedAt) || retryingId !== undefined" @click="retrySkip(item)" />
+        <Button :label="retryingId === item.id ? '重试中…' : item.resolvedAt ? '已恢复' : '单独重试'" icon="pi pi-refresh" size="small" outlined :loading="retryingId === item.id" :disabled="diagnosticsRunning || running || Boolean(item.resolvedAt) || retryingId !== undefined" @click="retrySkip(item)" />
       </article>
     </div>
   </section>

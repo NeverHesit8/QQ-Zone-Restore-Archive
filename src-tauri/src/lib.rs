@@ -1,4 +1,5 @@
 mod archive;
+mod history_diagnostics;
 mod qlogin;
 mod qzone;
 
@@ -11,6 +12,7 @@ fn exit_app(app: tauri::AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .manage(archive::ArchiveState::new())
+        .manage(history_diagnostics::HistoryDiagnosticsState::default())
         .manage(qlogin::QLoginState::new())
         .manage(qzone::RecycleAuthState::default())
         .manage(qzone::QzonePageTokenState::default())
@@ -42,6 +44,9 @@ pub fn run() {
             qzone::recover_recycle_album,
             qzone::recover_recycle_photos,
             archive::start_feed_archive,
+            history_diagnostics::start_history_diagnostics,
+            history_diagnostics::get_history_diagnostics,
+            history_diagnostics::cancel_history_diagnostics,
             archive::get_archive_progress,
             archive::cancel_feed_archive,
             archive::list_archive_skips,
